@@ -501,24 +501,138 @@
   // ---------------------------------------------------------------------------
   // Track tab — small view-model over a live meta-extraction result + store
   // lookup so the "detected price" card and "N stores found" pill are real.
+  //
+  // The live read is a server-side scrape of the retailer, which takes seconds.
+  // For a page that's already tracked PriceBuddy has a recent price on file, so
+  // `insights` (the Insights view-model) supplies one to show in the meantime —
+  // and to keep showing if the live read comes back empty. `pending` means the
+  // live read hasn't landed yet; `storeMatches` is null until the lookup has.
   // ---------------------------------------------------------------------------
 
-  function buildTrack(extraction, storeMatches, host) {
-    const stores = Array.isArray(storeMatches) ? storeMatches : [];
+  // The id of the saved store a meta-extraction resolved, or null. Auto-detect
+  // returns an unsaved draft store of the same shape, just without an id.
+  function existingStoreId(extraction) {
+    const store = extraction && !extraction.error ? extraction.store : null;
+    return store && store.id != null ? store.id : null;
+  }
+
+  // `storeMatches` null means the lookup hasn't landed or failed — not that
+  // there's no store. Meta-extraction is a second witness: it resolves the
+  // domain's store server-side, and can see stores GET /api/stores doesn't
+  // return (ownerless ones, on instances that scope that endpoint by owner).
+  function storeSummary(storeMatches, extraction, tracked) {
+    const stores = Array.isArray(storeMatches) ? storeMatches : null;
+    const matchedId = existingStoreId(extraction);
+    const unseen = matchedId != null && !(stores || []).some((s) => s && s.id === matchedId);
+
+    let count = stores ? stores.length : null;
+    if (unseen) {
+      count = (count || 0) + 1;
+    }
+    // A tracked page has a store by definition, even if neither lookup saw it.
+    const found = count > 0 || tracked;
+
+    let pill;
+    if (found) {
+      pill = {
+        tone: 'good',
+        icon: '⌕',
+        text: count > 0 ? `${count} store${count === 1 ? '' : 's'} found` : 'store found',
+      };
+    } else if (stores) {
+      pill = { tone: 'neutral', icon: '+', text: 'new store' };
+    } else {
+      pill = { tone: 'neutral', icon: '?', text: 'store unknown' };
+    }
+    return { count, found, pill };
+  }
+
+  function buildTrack(extraction, storeMatches, host, { insights = null, pending = false } = {}) {
+    const tracked = !!(insights && !insights.error);
+    const stores = storeSummary(storeMatches, extraction, tracked);
+    const storedLabel = tracked && insights.here ? insights.here.priceLabel || null : null;
+
+    // `currency` / `locale` sit next to `price` on the meta-extraction response.
+    // Older instances omit them, in which case money() renders an unadorned
+    // number rather than guessing a symbol.
+    const liveLabel = extraction && extraction.price != null
+      ? money(extraction.price, extraction.currency, undefined, extraction.locale)
+      : null;
+
+    let priceSource = null;
+    let priceSub = 'tune selectors to detect a price';
+    if (liveLabel) {
+      priceSource = 'live';
+      priceSub = 'detected on this page';
+    } else if (storedLabel) {
+      priceSource = 'stored';
+      priceSub = pending
+        ? 'last checked · reading the live price…'
+        : "last checked · couldn't read it live";
+    } else if (pending) {
+      priceSub = 'reading this page…';
+    }
+
     return {
-      title: (extraction && extraction.title) || '',
-      image: (extraction && extraction.image) || null,
+      title: (extraction && extraction.title) || (tracked && insights.title) || '',
+      image: (extraction && extraction.image) || (tracked && insights.image) || null,
       domain: bareDomain(host),
-      // `currency` / `locale` sit next to `price` on the meta-extraction response.
-      // Older instances omit them, in which case money() renders an unadorned
-      // number rather than guessing a symbol.
-      priceLabel: extraction && extraction.price != null
-        ? money(extraction.price, extraction.currency, undefined, extraction.locale)
-        : null,
+      priceLabel: liveLabel || storedLabel,
+      priceSource,
+      priceSub,
       currency: (extraction && extraction.currency) || null,
-      storeCount: stores.length,
-      storeFound: stores.length > 0,
+      storeCount: stores.count,
+      storeFound: stores.found,
+      storePill: stores.pill,
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // "Add to existing product" picker
+  //
+  // Searching runs server-side via `filter[search]` where the instance has it
+  // (capability `products_filter_search`), so it covers the whole library. Older
+  // instances get the most recently updated page, filtered here instead — which
+  // can miss an older product, hence the picker saying which mode it's in.
+  // ---------------------------------------------------------------------------
+
+  const PRODUCT_PICKER_LIMIT = 50;
+
+  function productSearchParams(query, { serverSearch = false, sparse = false } = {}) {
+    const params = { sort: '-updated_at', per_page: PRODUCT_PICKER_LIMIT };
+    // Each product otherwise carries its full price_cache history, which for 50
+    // products is most of the payload and none of what a picker needs.
+    if (sparse) {
+      params['fields[products]'] = 'id,title,image';
+    }
+    const term = String(query || '').trim();
+    if (serverSearch && term) {
+      params['filter[search]'] = term;
+    }
+    return params;
+  }
+
+  function productOptions(products) {
+    return (Array.isArray(products) ? products : [])
+      .filter((p) => p && p.id != null)
+      .map((p) => ({
+        id: p.id,
+        title: (p.title && String(p.title).trim()) || `Product #${p.id}`,
+        image: p.image || null,
+      }));
+  }
+
+  // Every whitespace-separated term must appear somewhere in the title, so
+  // "headphones sony" still finds "Sony WH-1000XM5 Wireless Headphones".
+  function filterProducts(options, query, limit = PRODUCT_PICKER_LIMIT) {
+    const terms = String(query || '').toLowerCase().split(/\s+/).filter(Boolean);
+    const matches = terms.length
+      ? options.filter((o) => {
+          const title = o.title.toLowerCase();
+          return terms.every((t) => title.includes(t));
+        })
+      : options;
+    return matches.slice(0, limit);
   }
 
   const api = {
@@ -526,7 +640,8 @@
     normalizeUrl, bareDomain, trackedUrls, storeNameFromHost,
     sparklinePath, trendDirection,
     money, trackedFor, dealTiming, dealVerdictTone,
-    buildInsights, buildTrack,
+    buildInsights, buildTrack, existingStoreId,
+    PRODUCT_PICKER_LIMIT, productSearchParams, productOptions, filterProducts,
   };
 
   if (typeof module !== 'undefined' && module.exports) {

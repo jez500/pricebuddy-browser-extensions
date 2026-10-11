@@ -60,7 +60,8 @@ for the user's instance and avoids CORS entirely. `getClient()` refuses with
 | `src/background.js` | Service worker. Message router + panel toggle. Holds the token. |
 | `src/lib/api.js` | `PriceBuddyClient`. Thin, well-JSDoc'd HTTP wrapper. ESM. |
 | `src/content/viewmodels.js` | **Pure** transforms. No `chrome.*`, no DOM. UMD-ish: `module.exports` for tests, `window.PBView` in the page. |
-| `src/content/panel.js` | The panel: shadow DOM, three tabs, element picker, capability gating, inline logo, ~175 lines of CSS in a template literal. Classic script, injected after viewmodels.js. |
+| `src/content/attach-product.js` | "Add to existing product": the split Track button and the product search picker, plus their CSS. DOM only — takes `el`/`thumb`/`search`/`onSubmit` from the panel. `window.PBAttach`. |
+| `src/content/panel.js` | The panel: shadow DOM, three tabs, element picker, capability gating, inline logo, ~175 lines of CSS in a template literal. Classic script, injected last. |
 | `src/options/*` | Settings page. Plain script, not a module. |
 
 ### The viewmodels / panel split is the load-bearing convention
@@ -136,9 +137,20 @@ The PriceBuddy app is at `../price-buddy` when checked out alongside. Gotchas:
   This distinction has produced a wrong conclusion twice.
 - Treat `V.normalizeUrl` as **fallback-only**; don't build on it. See `TODO.md`
   for why it deliberately still strips the whole query string.
+- **`GET /api/stores` can miss a store that scraping uses.** Stores are shared
+  app-wide, but that endpoint has been scoped to the token's user, so ownerless
+  stores (`user_id` NULL — auto-created outside a request) are invisible to it.
+  Meta-extraction's `store.id` (present only for a *saved* store) is the second
+  witness: `V.existingStoreId()`. Don't treat an empty or failed lookup as "no
+  store" on its own.
 - `POST /api/meta-extraction` accepts an optional `store` body to test a *draft*
   strategy without saving anything. This is what powers "Test all".
 - `POST /api/products` with `create_store: true` auto-builds a store from the URL.
+  With `product_id` it adds the URL to that existing product instead ("Add to
+  existing product"); `title` is still required by validation but ignored.
+- `filter[search]` on products (title, all terms) is gated on the
+  `products_filter_search` capability; without it the picker falls back to the
+  50 most recently updated products, filtered client-side.
 - Product endpoints need a broad (`*`) token; meta-extraction only needs
   `user:detail` + `meta-extraction:extract`. The panel surfaces 403s with a
   "token too narrow" hint — preserve that when adding calls.

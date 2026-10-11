@@ -272,6 +272,11 @@ Save the **Client ID** and **Client secret**.
 
 ### 7c. Mint a refresh token
 
+The easy way: run `npx chrome-webstore-upload-keys`, paste the client ID and
+secret when prompted, and approve in the browser tab it opens. It runs a local
+server to catch Google's redirect and prints the refresh token. The manual route
+below does the same thing by hand.
+
 Visit this URL in a browser (substituting your client ID), approve the consent
 screen, and copy the `code` parameter from the resulting redirect:
 
@@ -300,24 +305,33 @@ publish rights over your extension — treat it like a password.**
 
 ### 7d. Store the secrets
 
-In the GitHub repo: **Settings → Secrets and variables → Actions → New repository
-secret**:
+Create a GitHub **Environment** named `chrome-web-store` (**Settings →
+Environments**) with yourself as a **required reviewer**, so nothing is published
+without a human approving the run. Add these as *environment* secrets, not repo
+secrets:
 
 | Secret | Value |
 | ------ | ----- |
-| `CWS_EXTENSION_ID` | The item ID from §6.5 |
+| `CWS_EXTENSION_ID` | The item ID — `khmeibbaaegidkjlkbckgnhfgpgfgnoe` |
+| `CWS_PUBLISHER_ID` | Developer Dashboard → **Publisher → Settings** → Publisher ID |
 | `CWS_CLIENT_ID` | From §7b |
 | `CWS_CLIENT_SECRET` | From §7b |
 | `CWS_REFRESH_TOKEN` | From §7c |
 
-Consider putting these in a GitHub **Environment** named `chrome-web-store` with
-a required reviewer, so a publish cannot happen without a human approving it.
+Or from a terminal (each prompts for the value, so it stays out of your shell
+history):
+
+```bash
+for s in CWS_EXTENSION_ID CWS_PUBLISHER_ID CWS_CLIENT_ID CWS_CLIENT_SECRET CWS_REFRESH_TOKEN; do
+  gh secret set "$s" --env chrome-web-store
+done
+```
 
 ---
 
 ## 8. GitHub Actions workflow
 
-Two workflows: one that validates every push, and one that publishes on a tag.
+Two workflows: one that validates every push, and one that releases to the store.
 
 ### 8a. CI — `.github/workflows/ci.yml`
 
@@ -339,132 +353,61 @@ real defects in the first version of this extension.
 
 ### 8b. Publish — `.github/workflows/publish.yml`
 
-**Already committed.** Reproduced here so the design notes below have something
-to point at; if it drifts from the file, the file wins.
+**Already committed.** Not reproduced here — it drifted the last time it was;
+read the file. Three ways in:
 
-```yaml
-name: Publish to Chrome Web Store
-
-on:
-  push:
-    tags: ['v*.*.*']
-  workflow_dispatch:
-    inputs:
-      publish:
-        description: 'Publish after upload (false = upload as draft only)'
-        type: boolean
-        default: false
-
-permissions:
-  contents: write
-
-jobs:
-  publish:
-    runs-on: ubuntu-latest
-    environment: chrome-web-store
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: Unit tests
-        working-directory: chrome
-        run: npm test
-
-      - name: Check tag matches manifest version
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          MANIFEST=$(node -p "require('./chrome/manifest.json').version")
-          if [ "$TAG" != "$MANIFEST" ]; then
-            echo "::error::Tag v$TAG does not match manifest version $MANIFEST"
-            exit 1
-          fi
-          echo "VERSION=$TAG" >> "$GITHUB_ENV"
-
-      - name: Build package
-        run: |
-          cd chrome
-          zip -r "../pricebuddy-companion-${VERSION:-dev}.zip" . \
-            -x 'test/*' 'package.json' 'images/*' '*.DS_Store' '*/.*'
-          cd ..
-          unzip -l "pricebuddy-companion-${VERSION:-dev}.zip"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: extension-zip
-          path: pricebuddy-companion-*.zip
-
-      - name: Upload to Chrome Web Store
-        run: |
-          npx --yes chrome-webstore-upload-cli@3 upload \
-            --source "pricebuddy-companion-${VERSION:-dev}.zip" \
-            --extension-id "$EXTENSION_ID" \
-            --client-id "$CLIENT_ID" \
-            --client-secret "$CLIENT_SECRET" \
-            --refresh-token "$REFRESH_TOKEN"
-        env:
-          EXTENSION_ID: ${{ secrets.CWS_EXTENSION_ID }}
-          CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
-          CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
-          REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
-
-      - name: Submit for review
-        if: startsWith(github.ref, 'refs/tags/') || inputs.publish
-        run: |
-          npx --yes chrome-webstore-upload-cli@3 publish \
-            --extension-id "$EXTENSION_ID" \
-            --client-id "$CLIENT_ID" \
-            --client-secret "$CLIENT_SECRET" \
-            --refresh-token "$REFRESH_TOKEN"
-        env:
-          EXTENSION_ID: ${{ secrets.CWS_EXTENSION_ID }}
-          CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
-          CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
-          REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
-
-      - name: GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: pricebuddy-companion-*.zip
-          generate_release_notes: true
-```
+| Trigger | What happens |
+| ------- | ------------ |
+| **Run workflow**, `bump: patch\|minor\|major` | The normal release. Bumps `chrome/manifest.json`, commits `chore: release vX.Y.Z` to `main`, tags it, uploads, submits for review, cuts a GitHub Release with the zip attached. |
+| **Run workflow**, `bump: none` | Uploads the manifest's current version unchanged. With `submit: false` it stays a draft you can inspect in the dashboard. Also the way to retry a failed upload. |
+| Push a `vX.Y.Z` tag | The manual route. The tag must match the manifest version. |
 
 Notes on the design:
 
+- **The bump happens inside the publish run.** The obvious alternative — a
+  "release" workflow that pushes a tag for this one to pick up — silently does
+  nothing: a tag pushed with `GITHUB_TOKEN` triggers no further workflows.
+- **The commit and tag are pushed before the upload.** A failed upload leaves a
+  tag that is trivial to delete or retry with `bump: none`; the reverse order can
+  leave a version live in the store with no commit behind it.
 - **Upload and publish are separate steps.** `upload` replaces the draft without
-  submitting it; `publish` is what starts the review. `workflow_dispatch` with
-  `publish: false` lets you push a draft and eyeball it in the dashboard first.
-- **`environment: chrome-web-store`** gates the job behind whatever protection
-  rules you configure — use a required reviewer so nothing ships unattended.
-- **The tag/manifest version check** prevents the most common release mistake:
-  tagging `v0.2.0` while `manifest.json` still says `0.1.0`. The store rejects any
-  upload whose version is not strictly greater than the published one, and the
-  error message is unhelpful.
+  submitting it; `publish` is what starts the review.
+- **`environment: chrome-web-store`** gates the job behind its protection rules.
+  Use a required reviewer: the approval comes before the bump, so rejecting a run
+  leaves no stray commit or tag.
+- **CLI v4 / Web Store API v2.** `chrome-webstore-upload-cli@4` uses the v2 API,
+  which needs `PUBLISHER_ID` in addition to the extension id. v3 used the older
+  API and did not.
+- **The tag/manifest version check** catches tagging `v0.2.0` while the manifest
+  still says `0.1.0`. The store rejects any upload whose version is not strictly
+  greater than the published one, and its error message is unhelpful.
 - **Publishing does not go live immediately.** `publish` submits for review;
-  approval takes anywhere from an hour to several days. Add
-  `--target trustedTesters` to the publish command to release to your tester group
-  instead of the public channel.
+  approval takes anywhere from an hour to several days. Staged rollout and the
+  trusted-testers channel are managed in the dashboard.
 
 ---
 
 ## 9. Release process
 
+1. Merge what you want released into `main`.
+2. **Actions → Publish to Chrome Web Store → Run workflow** on `main`. Pick
+   `patch` / `minor` / `major`; leave `submit` ticked.
+3. Approve the deployment when the run pauses on the `chrome-web-store`
+   environment.
+
+Release notes are generated from the commit log. To release by hand instead:
+
 ```bash
-# 1. Bump the version in chrome/manifest.json (e.g. 0.1.0 -> 0.2.0)
+# Bump the version in chrome/manifest.json (e.g. 0.1.0 -> 0.2.0)
 git commit -am "chore: release v0.2.0"
 git tag v0.2.0
 git push origin main --tags
-# 2. Approve the deployment in the Actions tab if you configured a reviewer
-# Release notes are generated from the commit log by publish.yml.
 ```
 
 Chrome extension versions must be **1–4 dot-separated integers**, each 0–65535.
-`0.2.0` is valid; `0.2.0-beta` is not. If you want prerelease semantics, use the
-store's *trusted testers* channel rather than a version suffix.
+`0.2.0` is valid; `0.2.0-beta` is not. The workflow only auto-bumps 1–3 part
+versions. If you want prerelease semantics, use the store's *trusted testers*
+channel rather than a version suffix.
 
 Rollout is staged by default for updates. If you push a bad release, use
 **Cancel rollout** in the dashboard, then upload a fixed higher version — you

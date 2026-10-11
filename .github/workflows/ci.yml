@@ -26,7 +26,7 @@ jobs:
           # Classic scripts (content scripts + options) and ES modules (service
           # worker + api client) need different parse modes. package.json is
           # commonjs so the tests run, which is why --input-type is needed here.
-          for f in src/content/panel.js src/content/viewmodels.js src/options/options.js; do
+          for f in src/content/panel.js src/content/viewmodels.js src/content/attach-product.js src/options/options.js; do
             node --check "$f" && echo "ok  $f"
           done
           for f in src/background.js src/lib/api.js; do

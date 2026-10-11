@@ -406,3 +406,151 @@ test('buildTrack reflects a live extraction and store matches', () => {
   assert.equal(empty.priceLabel, null);
   assert.equal(empty.storeFound, false);
 });
+
+// ---------------------------------------------------------------------------
+// Track: stored price while the live scrape is in flight
+// ---------------------------------------------------------------------------
+
+// The slice of an Insights view-model buildTrack reads.
+const trackedInsights = {
+  title: 'Sony WH-1000XM5',
+  image: 'stored.jpg',
+  here: { priceLabel: '$399.00' },
+};
+
+test('buildTrack shows the stored price while the live read is pending', () => {
+  const vm = V.buildTrack(null, null, 'www.amazon.com.au', { insights: trackedInsights, pending: true });
+  assert.equal(vm.priceLabel, '$399.00');
+  assert.equal(vm.priceSource, 'stored');
+  assert.match(vm.priceSub, /reading the live price/);
+  assert.equal(vm.title, 'Sony WH-1000XM5');
+  assert.equal(vm.image, 'stored.jpg');
+  // Store lookup not back yet: the count is unknown, but a tracked page has a
+  // store by definition.
+  assert.equal(vm.storeCount, null);
+  assert.equal(vm.storeFound, true);
+});
+
+test('buildTrack prefers the live price once it lands', () => {
+  const vm = V.buildTrack({ title: 'Live title', price: 379, currency: 'AUD' }, [{ id: 1 }], 'www.amazon.com.au', { insights: trackedInsights });
+  assert.equal(vm.priceLabel, '$379.00');
+  assert.equal(vm.priceSource, 'live');
+  assert.equal(vm.priceSub, 'detected on this page');
+  assert.equal(vm.title, 'Live title');
+});
+
+test('buildTrack keeps the stored price when the live read finds none', () => {
+  const vm = V.buildTrack({ title: 'Live title', price: null }, [{ id: 1 }], 'www.amazon.com.au', { insights: trackedInsights });
+  assert.equal(vm.priceLabel, '$399.00');
+  assert.equal(vm.priceSource, 'stored');
+  assert.match(vm.priceSub, /couldn't read it live/);
+});
+
+test('buildTrack with neither price asks for tuning', () => {
+  const vm = V.buildTrack(null, [], 'shop.example.com');
+  assert.equal(vm.priceSource, null);
+  assert.equal(vm.priceSub, 'tune selectors to detect a price');
+});
+
+// ---------------------------------------------------------------------------
+// Add to existing product: search params + client-side filtering
+// ---------------------------------------------------------------------------
+
+test('productSearchParams asks for a lean, recent-first page of 50', () => {
+  assert.deepEqual(V.productSearchParams('', { serverSearch: true, sparse: true }), {
+    'fields[products]': 'id,title,image',
+    sort: '-updated_at',
+    per_page: 50,
+  });
+});
+
+test('productSearchParams only sends filter[search] when the server supports it', () => {
+  assert.equal(V.productSearchParams('  sony  ', { serverSearch: true, sparse: true })['filter[search]'], 'sony');
+  assert.equal(V.productSearchParams('   ', { serverSearch: true, sparse: true })['filter[search]'], undefined);
+  assert.equal(V.productSearchParams('sony', { serverSearch: false, sparse: true })['filter[search]'], undefined);
+});
+
+test('productSearchParams drops the sparse fieldset on instances without it', () => {
+  assert.equal(V.productSearchParams('', { serverSearch: false, sparse: false })['fields[products]'], undefined);
+});
+
+test('productOptions normalises a product list and skips unusable rows', () => {
+  const options = V.productOptions([
+    { id: 7, title: 'Kettle', image: 'k.jpg', price_cache: [] },
+    { id: 8, title: '' },
+    { title: 'no id' },
+    null,
+  ]);
+  assert.deepEqual(options, [
+    { id: 7, title: 'Kettle', image: 'k.jpg' },
+    { id: 8, title: 'Product #8', image: null },
+  ]);
+  assert.deepEqual(V.productOptions(undefined), []);
+});
+
+test('filterProducts matches every term, case-insensitively, in any order', () => {
+  const options = [
+    { id: 1, title: 'Sony WH-1000XM5 Wireless Headphones' },
+    { id: 2, title: 'Sony Bravia TV' },
+    { id: 3, title: 'Bose QC45 Headphones' },
+  ];
+  assert.deepEqual(V.filterProducts(options, 'headphones sony').map((p) => p.id), [1]);
+  assert.deepEqual(V.filterProducts(options, 'SONY').map((p) => p.id), [1, 2]);
+  assert.deepEqual(V.filterProducts(options, '  ').map((p) => p.id), [1, 2, 3]);
+  assert.deepEqual(V.filterProducts(options, 'nothing'), []);
+});
+
+test('filterProducts caps the result list', () => {
+  const many = Array.from({ length: 80 }, (_, i) => ({ id: i + 1, title: `Item ${i + 1}` }));
+  assert.equal(V.filterProducts(many, '').length, V.PRODUCT_PICKER_LIMIT);
+  assert.equal(V.filterProducts(many, 'item', 5).length, 5);
+});
+
+// ---------------------------------------------------------------------------
+// Store pill: the stores API can miss a store meta-extraction matched
+// ---------------------------------------------------------------------------
+
+test('existingStoreId only counts a saved store, not a detected draft', () => {
+  assert.equal(V.existingStoreId({ price: 1, store: { id: 12, name: 'Amazon AU' } }), 12);
+  // Auto-detect returns an unsaved store: same shape, no id.
+  assert.equal(V.existingStoreId({ price: 1, store: { name: 'Shop.com' } }), null);
+  assert.equal(V.existingStoreId({ price: 1, store: {} }), null);
+  assert.equal(V.existingStoreId({ error: 'x', store: { id: 3 } }), null);
+  assert.equal(V.existingStoreId(null), null);
+});
+
+test('buildTrack counts a store meta-extraction matched even when the lookup missed it', () => {
+  // Regression: an ownerless store is invisible to GET /api/stores but still
+  // resolved by meta-extraction, and the pill said "new store".
+  const vm = V.buildTrack({ price: 34, store: { id: 12 } }, [], 'www.amazon.com.au');
+  assert.equal(vm.storeFound, true);
+  assert.equal(vm.storeCount, 1);
+  assert.deepEqual(vm.storePill, { tone: 'good', icon: '⌕', text: '1 store found' });
+});
+
+test('buildTrack does not double-count a matched store the lookup also returned', () => {
+  const vm = V.buildTrack({ price: 34, store: { id: 12 } }, [{ id: 12 }, { id: 13 }], 'www.amazon.com.au');
+  assert.equal(vm.storeCount, 2);
+  assert.equal(vm.storePill.text, '2 stores found');
+});
+
+test('buildTrack says "new store" only when the lookup really came back empty', () => {
+  const fresh = V.buildTrack({ price: 34, store: { name: 'Draft' } }, [], 'shop.example.com');
+  assert.deepEqual(fresh.storePill, { tone: 'neutral', icon: '+', text: 'new store' });
+
+  // A failed lookup (null) is not evidence there's no store.
+  const failed = V.buildTrack({ price: 34 }, null, 'shop.example.com');
+  assert.equal(failed.storeFound, false);
+  assert.equal(failed.storePill.text, 'store unknown');
+});
+
+test('buildTrack pill while pending on a tracked page', () => {
+  const vm = V.buildTrack(null, null, 'www.amazon.com.au', { insights: trackedInsights, pending: true });
+  assert.equal(vm.storePill.text, 'store found');
+});
+
+test('buildTrack never says "0 stores found" for a tracked page', () => {
+  const vm = V.buildTrack({ price: 34 }, [], 'www.amazon.com.au', { insights: trackedInsights });
+  assert.equal(vm.storeFound, true);
+  assert.equal(vm.storePill.text, 'store found');
+});
