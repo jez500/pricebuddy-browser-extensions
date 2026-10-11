@@ -106,9 +106,11 @@
 
   // Cached async data so switching tabs doesn't re-hit the API.
   let detected = null;               // last *auto* meta-extraction result
+  let detecting = null;              // the in-flight one, shared by every caller
   let testResult = null;             // last "Test all" result (draft strategy)
   let insightsVM = null;             // built Insights view-model (null = not tracked)
   let trackVM = null;                // Track view-model
+  let attachOpen = false;            // Track: showing the "add to existing product" picker
   let loaded = { track: false, insights: false, tune: false };
 
   // Client-side (SPA) navigation changes the product without reloading the page,
@@ -552,6 +554,7 @@
     products_current_url: false,
     products_sparse_fieldsets: false,
     stores_filter_domain: false,
+    products_filter_search: false,
   };
 
   let caps = null;
@@ -563,11 +566,21 @@
     return `pb:caps:${apiBase}`;
   }
 
-  async function loadCapabilities() {
-    if (caps) {
-      return caps;
-    }
+  // The panel's opening requests all want capabilities at once; share one load
+  // rather than racing several client-config fetches on a cold cache.
+  let capsLoading = null;
 
+  function loadCapabilities() {
+    if (caps) {
+      return Promise.resolve(caps);
+    }
+    if (!capsLoading) {
+      capsLoading = fetchCapabilities().finally(() => { capsLoading = null; });
+    }
+    return capsLoading;
+  }
+
+  async function fetchCapabilities() {
     const key = capsKey();
     const cached = (await chrome.storage.local.get(key))[key];
     if (cached && cached.caps && cached.expires > Date.now()) {
@@ -640,20 +653,40 @@
     });
   }
 
+  const SCRAPE_NOTE = 'Still reading this page — PriceBuddy is scraping it live…';
+
   // Ask PriceBuddy to extract (auto-detecting / matching a store) for this page.
   // `heal` is deliberately omitted: PriceBuddy defaults it off, and the AI path
   // is slow, best-effort, and may return a different strategy than the one being
   // tested. It's offered as an explicit action instead — see onHeal().
-  async function ensureDetected() {
+  //
+  // The scrape takes seconds, so the panel starts it on open and every caller
+  // shares that one request rather than each starting its own.
+  function ensureDetected() {
     if (detected) {
-      return detected;
+      return Promise.resolve(detected);
     }
-    const res = await withProgressNote(
-      send({ type: 'pb:meta-extraction', url: location.href, timeoutMs: await extractionTimeoutMs() }),
-      'Still reading this page — PriceBuddy is scraping it live…',
-    );
-    detected = res.ok ? res.data : { error: res.error, status: res.status };
-    return detected;
+    if (!detecting) {
+      const run = (async () => {
+        const res = await send({ type: 'pb:meta-extraction', url: location.href, timeoutMs: await extractionTimeoutMs() });
+        return res.ok ? res.data : { error: res.error, status: res.status };
+      })();
+      detecting = run;
+      run.then((result) => {
+        // A page change or a fetch-method change may have discarded this run
+        // while it was in flight; it mustn't repopulate the cache afterwards.
+        if (detecting === run) {
+          detected = result;
+          detecting = null;
+        }
+      });
+    }
+    return detecting;
+  }
+
+  function forgetDetection() {
+    detected = null;
+    detecting = null;
   }
 
   // Explicit "let the AI work it out". Separate from auto-detect because it can
@@ -672,6 +705,7 @@
       return;
     }
 
+    forgetDetection();
     detected = res.data;
     const healing = res.data.healing || {};
     if (healing.applied) {
@@ -715,9 +749,11 @@
     };
   }
 
-  // Find how many stores already match this domain (for the Track "N stores" pill).
+  // Stores matching this domain, for the Track pill — or null if the lookup
+  // failed, which must not read as "no store exists".
   async function lookupStores() {
-    return (await findStoresForDomain()).stores;
+    const found = await findStoresForDomain();
+    return found.ok ? found.stores : null;
   }
 
   // The products API caps `per_page` at 100 server-side and offers no URL filter,
@@ -873,7 +909,8 @@
   // ---------------------------------------------------------------------------
 
   function resetPageCaches() {
-    detected = null;
+    forgetDetection();
+    attachOpen = false;
     testResult = null;
     insightsVM = null;
     trackVM = null;
@@ -956,18 +993,34 @@
 
   async function renderTrack(box) {
     if (!loaded.track) {
-      box.append(el('div', { className: 'pb-loading', textContent: 'Reading this page…' }));
-      const [ext, stores] = await Promise.all([ensureDetected(), lookupStores()]);
-      trackVM = V.buildTrack(ext && !ext.error ? ext : null, stores, location.host);
+      // A tracked page already has a recent price on file — show that straight
+      // away rather than a spinner for the seconds the live scrape takes.
+      const provisional = V.buildTrack(null, null, location.host, { insights: insightsVM, pending: true });
+      if (provisional.priceLabel) {
+        drawTrack(box, provisional);
+      } else {
+        box.append(el('div', { className: 'pb-loading', textContent: 'Reading this page…' }));
+      }
+
+      const url = location.href;
+      const [ext, stores] = await Promise.all([withProgressNote(ensureDetected(), SCRAPE_NOTE), lookupStores()]);
+      if (url !== location.href) {
+        return; // navigated meanwhile; resetPageCaches() has already moved on
+      }
+      trackVM = V.buildTrack(ext && !ext.error ? ext : null, stores, location.host, { insights: insightsVM });
       loaded.track = true;
-      if (activeTab === 'track') {
+      // Redrawing under an open picker would throw away what's been typed into
+      // it; the live price shows when the picker closes.
+      if (activeTab === 'track' && !attachOpen) {
         renderContent();
       }
       return;
     }
 
-    const vm = trackVM || V.buildTrack(null, [], location.host);
+    drawTrack(box, trackVM || V.buildTrack(null, [], location.host));
+  }
 
+  function drawTrack(box, vm) {
     // Product identity row.
     const idRow = el('div', { className: 'pb-track-id' }, [
       thumb(vm.image, 'lg'),
@@ -982,34 +1035,45 @@
     box.append(idRow);
 
     // Detected price card.
+    const pill = vm.storePill;
     const priceCard = el('div', { className: 'pb-detect-card' }, [
       el('div', {}, [
         el('div', { className: 'pb-detect-price', textContent: vm.priceLabel || 'No price found' }),
-        el('div', { className: 'pb-detect-sub', textContent: vm.priceLabel ? 'detected on this page' : 'tune selectors to detect a price' }),
+        el('div', { className: 'pb-detect-sub', textContent: vm.priceSub }),
       ]),
       el('span', { className: 'pb-spacer' }),
-      el('span', { className: `pb-pill ${vm.storeFound ? 'pb-pill-good' : 'pb-pill-neutral'}` }, [
-        el('span', { className: 'pb-pill-icon', textContent: vm.storeFound ? '⌕' : '+' }),
-        el('span', {
-          textContent: vm.storeFound
-            ? `${vm.storeCount} store${vm.storeCount === 1 ? '' : 's'} found`
-            : 'new store',
-        }),
+      el('span', { className: `pb-pill pb-pill-${pill.tone}` }, [
+        el('span', { className: 'pb-pill-icon', textContent: pill.icon }),
+        el('span', { textContent: pill.text }),
       ]),
     ]);
     box.append(priceCard);
+
+    if (attachOpen) {
+      box.append(window.PBAttach.picker({
+        el,
+        thumb,
+        search: searchProducts(),
+        onSubmit: onAttach,
+        onCancel: () => { attachOpen = false; renderContent(); },
+      }));
+      return;
+    }
 
     // Actions. When the page is already tracked, offering "Track this product"
     // as the primary action alongside an "already tracking" note is contradictory
     // — and acting on it creates a duplicate. Lead with Insights instead.
     const alreadyTracked = !!insightsVM && !insightsVM.error;
-    const trackBtn = el('button', {
-      className: `pb-btn pb-btn-block ${alreadyTracked ? 'pb-btn-soft' : 'pb-btn-primary'}`,
-    }, [
-      el('span', { className: 'pb-btn-icon', textContent: alreadyTracked ? '⧉' : '+' }),
-      document.createTextNode(alreadyTracked ? ' Track again as a new product' : ' Track this product'),
-    ]);
-    trackBtn.addEventListener('click', onTrack);
+    const trackBtn = window.PBAttach.splitButton({
+      el,
+      label: alreadyTracked ? 'Track again as a new product' : 'Track this product',
+      icon: alreadyTracked ? '⧉' : '+',
+      variant: alreadyTracked ? 'pb-btn-soft' : 'pb-btn-primary',
+      onPrimary: onTrack,
+      items: [
+        { label: 'Add to existing product', onSelect: () => { attachOpen = true; renderContent(); } },
+      ],
+    });
 
     if (alreadyTracked) {
       const seeInsights = el('button', {
@@ -1041,6 +1105,30 @@
     return b;
   }
 
+  const TOKEN_TOO_NARROW = 'Token lacks product access. Create an "all access" token to track products.';
+
+  // Both Track actions are a POST /api/products: without `product_id` it creates
+  // a product, with one it adds this page as another URL on that product. Either
+  // way PriceBuddy scrapes the page again before answering. Resolves true on
+  // success.
+  async function submitProduct(payload, pending, done) {
+    setStatus(pending, 'info');
+    const res = await send({ type: 'pb:create-product', payload });
+    if (!res.ok) {
+      setStatus(res.status === 403 ? TOKEN_TOO_NARROW : `Error: ${res.error}`, 'error');
+      return false;
+    }
+    const product = res.data && res.data.data ? res.data.data : res.data;
+    setStatus(done(product), 'success');
+    attachOpen = false;
+    // Refresh insights so the Insights tab reflects the new product.
+    loaded.insights = false;
+    insightsVM = await loadInsights();
+    loaded.insights = true;
+    setTab('insights');
+    return true;
+  }
+
   async function onTrack() {
     setStatus('Adding to PriceBuddy…', 'info');
     const ext = await ensureDetected();
@@ -1049,20 +1137,58 @@
     if (ext && !ext.error && ext.image) {
       payload.image = ext.image;
     }
-    const res = await send({ type: 'pb:create-product', payload });
-    if (!res.ok) {
-      setStatus(res.status === 403
-        ? 'Token lacks product access. Create an "all access" token to track products.'
-        : `Error: ${res.error}`, 'error');
-      return;
-    }
-    const product = res.data && res.data.data ? res.data.data : res.data;
-    setStatus(`Tracking "${product.title || title}" (product #${product.id}).`, 'success');
-    // Refresh insights so the Insights tab reflects the new product.
-    loaded.insights = false;
-    insightsVM = await loadInsights();
-    loaded.insights = true;
-    setTab('insights');
+    return submitProduct(payload, 'Adding to PriceBuddy…', (product) => (
+      `Tracking "${product.title || title}" (product #${product.id}).`
+    ));
+  }
+
+  // `title` is required by the endpoint's validation but unused when attaching —
+  // the product keeps its own — so send the product's.
+  function onAttach(option) {
+    return submitProduct(
+      { title: option.title, url: location.href, product_id: option.id },
+      `Adding this page to "${option.title}"…`,
+      (product) => `Added this page to "${product.title || option.title}" (product #${product.id}).`,
+    );
+  }
+
+  // A search function for one picker session. Searches server-side where the
+  // instance supports `filter[search]`; otherwise fetches the 50 most recently
+  // updated products once and filters those locally.
+  function searchProducts() {
+    let recent = null;
+    let searchRejected = false;
+
+    return async function search(query) {
+      const c = await loadCapabilities();
+      const serverSearch = !!c.products_filter_search && !searchRejected;
+      const note = serverSearch
+        ? ''
+        : `Showing your ${V.PRODUCT_PICKER_LIMIT} most recently updated products. Update PriceBuddy to search them all.`;
+
+      if (!serverSearch && recent) {
+        return { ok: true, options: V.filterProducts(recent, query), note };
+      }
+
+      const res = await send({
+        type: 'pb:list-products',
+        params: V.productSearchParams(query, { serverSearch, sparse: !!c.products_sparse_fieldsets }),
+      });
+      if (!res.ok) {
+        if (serverSearch && isCapabilityMiss(res)) {
+          searchRejected = true; // stale capability — fall back for this session
+          return search(query);
+        }
+        return { ok: false, error: res.status === 403 ? TOKEN_TOO_NARROW : res.error, note };
+      }
+
+      const options = V.productOptions(res.data && res.data.data);
+      if (serverSearch) {
+        return { ok: true, options, note };
+      }
+      recent = options;
+      return { ok: true, options: V.filterProducts(recent, query), note };
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -1272,7 +1398,7 @@
       box.append(el('div', { className: 'pb-loading', textContent: 'Checking store…' }));
       currentState = await loadState();
       await prepareStoreForTune(currentState);
-      await ensureDetected();
+      await withProgressNote(ensureDetected(), SCRAPE_NOTE);
       loaded.tune = true;
       if (activeTab === 'tune') {
         renderContent();
@@ -1345,7 +1471,7 @@
       // describe what saving would do. Drop them rather than leave them looking
       // current.
       testResult = null;
-      detected = null;
+      forgetDetection();
       renderContent();
       setStatus('Fetch method changed — run “Test all” to check it.', 'info');
     });
@@ -1682,6 +1808,20 @@
       return;
     }
 
+    // The stores API found nothing, but meta-extraction resolved a saved store
+    // for this domain — one the API won't return to this token (an ownerless
+    // store, on instances that scope GET /api/stores by owner). Creating another
+    // would never be used: scraping keeps resolving the oldest match.
+    const hiddenStoreId = V.existingStoreId(detected);
+    if (hiddenStoreId != null) {
+      setStatus(
+        `PriceBuddy already has a store for this domain (#${hiddenStoreId}), but its API won't return it to this token, `
+        + 'so it can\'t be updated from here. Edit it in PriceBuddy instead — adding another store would be ignored.',
+        'error',
+      );
+      return;
+    }
+
     setStatus('Adding store…', 'info');
     const res = await send({ type: 'pb:create-store', payload });
     if (!res.ok) {
@@ -1714,7 +1854,7 @@
     root = host.attachShadow({ mode: 'open' });
 
     const style = document.createElement('style');
-    style.textContent = PANEL_CSS;
+    style.textContent = PANEL_CSS + window.PBAttach.CSS;
     root.append(style);
 
     theme = await resolveTheme();
@@ -1766,6 +1906,11 @@
     root.append(panel);
     applyTheme();
     watchUrl();
+
+    // Start the live scrape now rather than once the tab below is chosen: it's
+    // the slow request (a server-side fetch of the retailer's page), and the
+    // tracked-product lookup has nothing to do with it.
+    ensureDetected();
 
     // Smart default tab: Insights when this page is already tracked, else Track.
     insightsVM = await loadInsights();
@@ -1859,7 +2004,7 @@
     .pb-domain { display: flex; align-items: center; gap: 6px; margin-top: 5px; }
     .pb-domain-dot { width: 6px; height: 6px; border-radius: 2px; background: var(--teal); }
     .pb-domain-text { font: 500 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); }
-    .pb-pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 999px; font: 600 11px/1 system-ui, sans-serif; }
+    .pb-pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 999px; font: 600 11px/1 system-ui, sans-serif; white-space: nowrap; flex: none; }
     .pb-pill-good { background: var(--tealdim); border: 1px solid var(--goodln); color: var(--teal); }
     .pb-pill-neutral { background: var(--chip); border: 1px solid var(--line); color: var(--muted); }
     .pb-pill-icon { font-size: 11px; }

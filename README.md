@@ -28,7 +28,8 @@ The landing tab for a page that isn't tracked yet. Shows the product title,
 image and domain, the **price detected on this page**, and how many PriceBuddy
 stores already match the domain. **Track this product**
 (`POST /api/products` with `create_store: true`) starts monitoring it and jumps
-you to Insights.
+you to Insights. Its **▾** menu offers **Add to existing product** instead: search
+your products, pick one, and this page becomes another store for it.
 
 ### Insights
 
@@ -112,7 +113,8 @@ There is also a [user guide](https://pricebuddy.jez.me/browser-extension.html) i
 
 **Track a product** — open the panel on a product page; it lands on Track (or
 Insights if already tracked) and shows the detected price. Press **Track this
-product**.
+product**, or use its **▾** → **Add to existing product** to add this page to a
+product you already track elsewhere.
 
 **Tune a store** — switch to **Tune**. If Auto-detect found all three fields,
 press **Save to store**. Otherwise use **Manual override**: **◎ Pick on page**

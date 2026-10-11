@@ -14,7 +14,7 @@ import { PriceBuddyClient } from './lib/api.js';
 
 const SETTINGS_KEY = 'pricebuddy.settings';
 
-const PANEL_FILES = ['src/content/viewmodels.js', 'src/content/panel.js'];
+const PANEL_FILES = ['src/content/viewmodels.js', 'src/content/attach-product.js', 'src/content/panel.js'];
 
 /**
  * The host-permission pattern for a PriceBuddy base URL.
