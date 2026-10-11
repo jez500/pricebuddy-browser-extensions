@@ -272,6 +272,11 @@ Save the **Client ID** and **Client secret**.
 
 ### 7c. Mint a refresh token
 
+The easy way: run `npx chrome-webstore-upload-keys`, paste the client ID and
+secret when prompted, and approve in the browser tab it opens. It runs a local
+server to catch Google's redirect and prints the refresh token. The manual route
+below does the same thing by hand.
+
 Visit this URL in a browser (substituting your client ID), approve the consent
 screen, and copy the `code` parameter from the resulting redirect:
 
@@ -308,7 +313,7 @@ secrets:
 | Secret | Value |
 | ------ | ----- |
 | `CWS_EXTENSION_ID` | The item ID — `khmeibbaaegidkjlkbckgnhfgpgfgnoe` |
-| `CWS_PUBLISHER_ID` | Developer Dashboard → **Account** → Publisher ID |
+| `CWS_PUBLISHER_ID` | Developer Dashboard → **Publisher → Settings** → Publisher ID |
 | `CWS_CLIENT_ID` | From §7b |
 | `CWS_CLIENT_SECRET` | From §7b |
 | `CWS_REFRESH_TOKEN` | From §7c |
