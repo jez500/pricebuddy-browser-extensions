@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "PriceBuddy Companion",
   "short_name": "PriceBuddy",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pick price/title/image selectors on any product page and test them live against your PriceBuddy instance.",
   "homepage_url": "https://github.com/jez500/pricebuddy-browser-extensions",
   "minimum_chrome_version": "102",
