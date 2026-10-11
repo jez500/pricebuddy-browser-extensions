@@ -1,25 +1,51 @@
 name: Publish to Chrome Web Store
 
+# Three ways in:
+#   • Actions → "Publish to Chrome Web Store" → Run workflow, bump=patch|minor|major
+#     The normal release. Bumps chrome/manifest.json, commits, tags, uploads,
+#     submits for review and cuts a GitHub Release — all in this one run.
+#   • Run workflow with bump=none — uploads the manifest's current version as a
+#     draft (submit=false) so it can be inspected in the dashboard first.
+#   • Push a vX.Y.Z tag by hand — the manual route; the tag must match the manifest.
+#
+# The bump has to happen in this run rather than by pushing a tag for a second
+# workflow to pick up: a tag pushed with GITHUB_TOKEN deliberately triggers no
+# further workflows.
+
 on:
   push:
     tags: ['v*.*.*']
   workflow_dispatch:
     inputs:
-      publish:
-        description: 'Submit for review after upload (false = upload as a draft only)'
+      bump:
+        description: 'Version bump (none = upload the current manifest version unchanged)'
+        type: choice
+        options: [patch, minor, major, none]
+        default: patch
+      submit:
+        description: 'Submit for review after upload (false = leave it as a draft)'
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: write
 
+# Two releases racing would compute the same next version.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
-    # Configure this environment with a required reviewer so nothing reaches the
-    # store without a human approving the run. Secrets live here, not at repo
-    # level: CWS_EXTENSION_ID, CWS_CLIENT_ID, CWS_CLIENT_SECRET, CWS_REFRESH_TOKEN.
+    # Give this environment a required reviewer so nothing reaches the store
+    # without a human approving the run — the approval comes before the bump, so
+    # rejecting it leaves no stray commit or tag behind. Secrets live here, not at
+    # repo level: CWS_EXTENSION_ID, CWS_PUBLISHER_ID, CWS_CLIENT_ID,
+    # CWS_CLIENT_SECRET, CWS_REFRESH_TOKEN.
     environment: chrome-web-store
+    env:
+      BUMP: ${{ github.event_name == 'workflow_dispatch' && inputs.bump || 'none' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -30,6 +56,40 @@ jobs:
       - name: Unit tests
         working-directory: chrome
         run: npm test
+
+      - name: Check release branch
+        if: env.BUMP != 'none'
+        run: |
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "::error::Version bumps are released from main only (this run is on ${GITHUB_REF})."
+            exit 1
+          fi
+
+      - name: Bump version
+        if: env.BUMP != 'none'
+        run: |
+          # Edits the version string in place rather than re-serialising the
+          # manifest, which would reflow its hand-formatted arrays.
+          node -e '
+            const fs = require("fs");
+            const file = "chrome/manifest.json";
+            const src = fs.readFileSync(file, "utf8");
+            const current = JSON.parse(src).version;
+            const parts = current.split(".").map(Number);
+            if (parts.length > 3) {
+              console.error(`::error::Cannot auto-bump a 4-part version (${current}); bump it by hand.`);
+              process.exit(1);
+            }
+            while (parts.length < 3) parts.push(0);
+            const i = { major: 0, minor: 1, patch: 2 }[process.env.BUMP];
+            parts[i] += 1;
+            parts.fill(0, i + 1);
+            const next = parts.join(".");
+            fs.writeFileSync(file, src.replace(/("version"\s*:\s*")[^"]+(")/, `$1${next}$2`));
+            console.log(`${current} -> ${next}`);
+          '
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
       - name: Resolve version
         run: |
@@ -44,6 +104,16 @@ jobs:
           echo "VERSION=$MANIFEST" >> "$GITHUB_ENV"
           echo "Version $MANIFEST"
 
+      # Pushed before the upload: a failed upload leaves a tag that is easy to
+      # delete, whereas a version live in the store with no commit behind it is
+      # unreproducible. Re-run with bump=none to retry the upload.
+      - name: Commit and tag release
+        if: env.BUMP != 'none'
+        run: |
+          git commit -am "chore: release v${VERSION}"
+          git tag "v${VERSION}"
+          git push origin HEAD:main "v${VERSION}"
+
       - name: Build package
         run: |
           cd chrome
@@ -57,40 +127,34 @@ jobs:
           name: extension-zip
           path: pricebuddy-companion-*.zip
 
+      # v4 of the CLI talks to version 2 of the Chrome Web Store API, which
+      # addresses items by publisher as well as extension id. Credentials go in
+      # as environment variables rather than flags so they never appear in argv.
       - name: Upload to Chrome Web Store
         env:
           EXTENSION_ID: ${{ secrets.CWS_EXTENSION_ID }}
+          PUBLISHER_ID: ${{ secrets.CWS_PUBLISHER_ID }}
           CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
           CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
           REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
-        run: |
-          npx --yes chrome-webstore-upload-cli@3 upload \
-            --source "pricebuddy-companion-${VERSION}.zip" \
-            --extension-id "$EXTENSION_ID" \
-            --client-id "$CLIENT_ID" \
-            --client-secret "$CLIENT_SECRET" \
-            --refresh-token "$REFRESH_TOKEN"
+        run: npx --yes chrome-webstore-upload-cli@4 upload --source "pricebuddy-companion-${VERSION}.zip"
 
       # `upload` only replaces the draft. This is what starts the review, so it
-      # is deliberately separate: workflow_dispatch with publish=false lets you
-      # push a draft and inspect it in the dashboard first.
+      # is deliberately separate: submit=false leaves a draft to inspect first.
       - name: Submit for review
-        if: github.ref_type == 'tag' || inputs.publish
+        if: github.ref_type == 'tag' || inputs.submit
         env:
           EXTENSION_ID: ${{ secrets.CWS_EXTENSION_ID }}
+          PUBLISHER_ID: ${{ secrets.CWS_PUBLISHER_ID }}
           CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
           CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
           REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
-        run: |
-          npx --yes chrome-webstore-upload-cli@3 publish \
-            --extension-id "$EXTENSION_ID" \
-            --client-id "$CLIENT_ID" \
-            --client-secret "$CLIENT_SECRET" \
-            --refresh-token "$REFRESH_TOKEN"
+        run: npx --yes chrome-webstore-upload-cli@4 publish
 
       - name: GitHub Release
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' || env.BUMP != 'none'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ env.VERSION }}
           files: pricebuddy-companion-*.zip
           generate_release_notes: true

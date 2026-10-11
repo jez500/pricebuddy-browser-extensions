@@ -162,7 +162,7 @@ chrome/            The Chrome (MV3) extension
   images/          PriceBuddy wordmark (from the app repo)
   test/            node --test unit tests for the view-models
 assets/            Store screenshot + screencast (not shipped in the extension)
-.github/workflows/ ci.yml (every push) and publish.yml (on a v* tag)
+.github/workflows/ ci.yml (every push) and publish.yml (store release, run by hand)
 CLAUDE.md          Working notes for AI coding agents
 PRIVACY.md         Privacy policy
 PUBLISHING.md      Chrome Web Store submission + GitHub Actions release guide
